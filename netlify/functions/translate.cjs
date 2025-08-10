@@ -42,12 +42,14 @@ function chunkByLength(items, maxChars) {
   return chunks;
 }
 
+// ЗАМЕНИ ЭТУ ФУНКЦИЮ:
 function fetchJSON(urlStr, options = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(urlStr);
     const req = https.request(
       {
         hostname: u.hostname,
+        port: u.port || (u.protocol === "https:" ? 443 : 80),
         path: u.pathname + u.search,
         protocol: u.protocol,
         method: options.method || "GET",
@@ -62,14 +64,14 @@ function fetchJSON(urlStr, options = {}) {
         res.setEncoding("utf8");
         res.on("data", (chunk) => (data += chunk));
         res.on("end", () => {
-          try {
-            resolve(JSON.parse(data));
-          } catch {
-            reject(new Error("Bad JSON from Google Translate"));
-          }
+          try { resolve(JSON.parse(data)); }
+          catch { reject(new Error("Bad JSON from Google Translate")); }
         });
       }
     );
+    req.setTimeout(options.timeout || 8000, () => {
+      req.destroy(new Error("ETIMEDOUT"));
+    });
     req.on("error", reject);
     if (options.body) req.write(options.body);
     req.end();
@@ -90,24 +92,39 @@ async function googleTranslateBatch(texts, source, target) {
   return joined.split(SEP);
 }
 
+// ЗАМЕНИ ЭТУ ФУНКЦИЮ:
 async function libreTranslateBatch(texts, source, target) {
-  // Public instance; может быть медленным/лимитным
-  const endpoint = "https://translate.argosopentech.com/translate";
+  // Несколько публичных инстансов (м.б. нестабильны)
+  const endpoints = [
+    "https://libretranslate.de/translate",
+    "https://translate.astian.org/translate"
+  ];
   const SEP = "|||SEP|||";
   const q = texts.join(`\n${SEP}\n`);
   const body = JSON.stringify({
     q,
     source: source.toLowerCase() === "auto" ? "auto" : source.toLowerCase(),
     target: target.toLowerCase(),
-    format: "text",
+    format: "text"
   });
-  const data = await fetchJSON(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body,
-  });
-  const text = (data && data.translatedText) || "";
-  return text.split(SEP);
+
+  let lastErr;
+  for (const ep of endpoints) {
+    try {
+      const data = await fetchJSON(ep, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+        timeout: 8000
+      });
+      const text = (data && data.translatedText) || "";
+      return text.split(SEP);
+    } catch (e) {
+      lastErr = e;
+      // Переходим к следующему endpoint
+    }
+  }
+  throw lastErr || new Error("All LibreTranslate endpoints failed");
 }
 
 async function translateBatch(texts, source, target) {
@@ -119,8 +136,9 @@ async function translateBatch(texts, source, target) {
   }
 }
 
+// (опционально) чуть уменьшим размер батча, чтобы реже падал Google по длине URL:
 async function translateTexts(texts, source, target) {
-  const safeChunks = chunkByLength(texts, 800); // короче URL → меньше шансов на HTML-ответ
+  const safeChunks = chunkByLength(texts, 600);
   const out = [];
   for (const ch of safeChunks) {
     const part = await translateBatch(ch, source, target);
