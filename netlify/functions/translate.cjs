@@ -1,4 +1,4 @@
-\
+// netlify/functions/translate.cjs
 // Netlify Function: translates PPTX by rewriting <a:t>...</a:t> in slide XML.
 // Free translators: Google (unofficial) with fallback to LibreTranslate public instance.
 
@@ -28,7 +28,7 @@ function chunkByLength(items, maxChars) {
   let buf = [];
   let len = 0;
   for (const it of items) {
-    const add = it.length + 11;
+    const add = it.length + 11; // delimiter allowance
     if (len + add > maxChars && buf.length) {
       chunks.push(buf);
       buf = [it];
@@ -45,21 +45,31 @@ function chunkByLength(items, maxChars) {
 function fetchJSON(urlStr, options = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(urlStr);
-    const req = https.request({
-      hostname: u.hostname,
-      path: u.pathname + u.search,
-      protocol: u.protocol,
-      method: options.method || "GET",
-      headers: Object.assign({ "User-Agent": "netlify-function", "Accept": "application/json" }, options.headers || {})
-    }, (res) => {
-      let data = "";
-      res.setEncoding("utf8");
-      res.on("data", (chunk) => (data += chunk));
-      res.on("end", () => {
-        try { resolve(JSON.parse(data)); }
-        catch (e) { reject(new Error("Bad JSON from Google Translate")); }
-      });
-    });
+    const req = https.request(
+      {
+        hostname: u.hostname,
+        path: u.pathname + u.search,
+        protocol: u.protocol,
+        method: options.method || "GET",
+        headers: {
+          "User-Agent": "netlify-function",
+          "Accept": "application/json",
+          ...(options.headers || {}),
+        },
+      },
+      (res) => {
+        let data = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => (data += chunk));
+        res.on("end", () => {
+          try {
+            resolve(JSON.parse(data));
+          } catch {
+            reject(new Error("Bad JSON from Google Translate"));
+          }
+        });
+      }
+    );
     req.on("error", reject);
     if (options.body) req.write(options.body);
     req.end();
@@ -69,19 +79,33 @@ function fetchJSON(urlStr, options = {}) {
 async function googleTranslateBatch(texts, source, target) {
   const SEP = "|||SEP|||";
   const q = texts.join(`\n${SEP}\n`);
-  const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${encodeURIComponent(source)}&tl=${encodeURIComponent(target)}&dt=t&ie=UTF-8&oe=UTF-8&q=${encodeURIComponent(q)}`;
+  const url =
+    `https://translate.googleapis.com/translate_a/single?client=gtx` +
+    `&sl=${encodeURIComponent(source)}` +
+    `&tl=${encodeURIComponent(target)}` +
+    `&dt=t&ie=UTF-8&oe=UTF-8` +
+    `&q=${encodeURIComponent(q)}`;
   const data = await fetchJSON(url);
-  const joined = (data[0] || []).map(x => x[0]).join("");
+  const joined = (data[0] || []).map((x) => x[0]).join("");
   return joined.split(SEP);
 }
 
 async function libreTranslateBatch(texts, source, target) {
-  // Public instance (can be rate-limited): argosopentech
+  // Public instance; может быть медленным/лимитным
   const endpoint = "https://translate.argosopentech.com/translate";
   const SEP = "|||SEP|||";
   const q = texts.join(`\n${SEP}\n`);
-  const body = JSON.stringify({ q, source: source.toLowerCase() === "auto" ? "auto" : source.lowercase || source, target: target.toLowerCase() });
-  const data = await fetchJSON(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body });
+  const body = JSON.stringify({
+    q,
+    source: source.toLowerCase() === "auto" ? "auto" : source.toLowerCase(),
+    target: target.toLowerCase(),
+    format: "text",
+  });
+  const data = await fetchJSON(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+  });
   const text = (data && data.translatedText) || "";
   return text.split(SEP);
 }
@@ -89,14 +113,14 @@ async function libreTranslateBatch(texts, source, target) {
 async function translateBatch(texts, source, target) {
   try {
     return await googleTranslateBatch(texts, source, target);
-  } catch (e) {
-    // Fallback to LibreTranslate if Google returns HTML / non-JSON / rate-limited
+  } catch {
+    // Если Google вернул HTML/не JSON — пробуем LibreTranslate
     return await libreTranslateBatch(texts, source, target);
   }
 }
 
-async function googleTranslate(texts, source, target) {
-  const safeChunks = chunkByLength(texts, 1000);
+async function translateTexts(texts, source, target) {
+  const safeChunks = chunkByLength(texts, 800); // короче URL → меньше шансов на HTML-ответ
   const out = [];
   for (const ch of safeChunks) {
     const part = await translateBatch(ch, source, target);
@@ -108,8 +132,12 @@ async function googleTranslate(texts, source, target) {
 async function translateXml(xml, source, target) {
   const tags = Array.from(findTextTags(xml));
   if (tags.length === 0) return xml;
-  const texts = tags.map(t => t.inner);
-  const translated = await googleTranslate(texts, (source || "en"), (target || "ru"));
+  const texts = tags.map((t) => t.inner);
+  const translated = await translateTexts(
+    texts,
+    (source || "en"),
+    (target || "ru")
+  );
 
   let out = "";
   let cursor = 0;
@@ -125,24 +153,37 @@ async function translateXml(xml, source, target) {
 
 exports.handler = async (event) => {
   if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 204, headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "POST,OPTIONS" } };
+    return {
+      statusCode: 204,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST,OPTIONS",
+      },
+    };
   }
   if (event.httpMethod !== "POST") {
     return { statusCode: 405, body: "Use POST with PPTX binary body." };
   }
 
   try {
-    const source = (event.queryStringParameters && event.queryStringParameters.source) || "EN";
-    const target = (event.queryStringParameters && event.queryStringParameters.target) || "RU";
+    const source =
+      (event.queryStringParameters && event.queryStringParameters.source) ||
+      "EN";
+    const target =
+      (event.queryStringParameters && event.queryStringParameters.target) ||
+      "RU";
 
     if (!event.body) return { statusCode: 400, body: "Empty body" };
-    const buffer = event.isBase64Encoded ? Buffer.from(event.body, "base64") : Buffer.from(event.body);
+    const buffer = event.isBase64Encoded
+      ? Buffer.from(event.body, "base64")
+      : Buffer.from(event.body);
 
     const zip = await JSZip.loadAsync(buffer);
 
-    const fileNames = Object.keys(zip.files).filter(name =>
-      (name.startsWith("ppt/slides/slide") && name.endsWith(".xml")) ||
-      (name.startsWith("ppt/notesSlides/notesSlide") && name.endsWith(".xml"))
+    const fileNames = Object.keys(zip.files).filter(
+      (name) =>
+        (name.startsWith("ppt/slides/slide") && name.endsWith(".xml")) ||
+        (name.startsWith("ppt/notesSlides/notesSlide") && name.endsWith(".xml"))
     );
 
     for (const name of fileNames) {
@@ -156,11 +197,13 @@ exports.handler = async (event) => {
     return {
       statusCode: 200,
       headers: {
-        "Content-Type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        "Content-Disposition": 'attachment; filename="translated_ru.pptx"'
+        "Content-Type":
+          "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "Content-Disposition":
+          'attachment; filename="translated_ru.pptx"',
       },
       body: outBuf.toString("base64"),
-      isBase64Encoded: true
+      isBase64Encoded: true,
     };
   } catch (err) {
     console.error(err);
